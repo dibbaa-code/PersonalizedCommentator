@@ -1,4 +1,4 @@
-# AI Football Commentator Example
+# Personalized AI Football Commentator
 
 [Vision Agents](https://visionagents.ai/) is our open source framework for quickly building low-latency video AI applications on the edge. It runs on Stream’s global edge network by default, supports any edge provider and integrates with 25+ leading voice and video AI models. 
 
