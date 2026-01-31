@@ -1,0 +1,17 @@
+[project]
+name = "personalized-commentator"
+version = "0.1.0"
+description = "AI Football Commentator using Vision Agents"
+requires-python = ">=3.10"
+dependencies = [
+    "vision-agents[gemini]",
+    "vision-agents-plugins-getstream",
+    "vision-agents-plugins-roboflow",
+    "python-dotenv",
+]
+
+[tool.uv]
+package = false
+override-dependencies = [
+    "aiohttp>=3.11.16",
+]

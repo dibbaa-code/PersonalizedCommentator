@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 from utils import Debouncer
 from vision_agents.core import Agent, Runner, User
 from vision_agents.core.agents import AgentLauncher
-from vision_agents.plugins import getstream, openai, roboflow
+from vision_agents.plugins import getstream, gemini, roboflow
 
 logger = logging.getLogger(__name__)
 
@@ -13,7 +13,7 @@ load_dotenv()
 
 
 async def create_agent(**kwargs) -> Agent:
-    llm = openai.Realtime()
+    llm = gemini.Realtime()
 
     agent = Agent(
         edge=getstream.Edge(),  # low latency edge. clients for React, iOS, Android, RN, Flutter etc.
