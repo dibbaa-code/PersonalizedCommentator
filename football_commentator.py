@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 
 from dotenv import load_dotenv
@@ -11,14 +12,37 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+# Path to instructions file
+INSTRUCTIONS_PATH = os.path.join(os.path.dirname(__file__), "instructions.md")
+
+
+def get_instructions() -> str:
+    """Read instructions.md and replace placeholders with env values."""
+    with open(INSTRUCTIONS_PATH, "r") as f:
+        template = f.read()
+
+    fav_color = os.getenv("FAV_JERSEY_COLOR", "")
+    level = os.getenv("KNOWLEDGE_LEVEL", "beginner")
+    style = os.getenv("COMMENTARY_STYLE", "roasting")
+
+    # Replace placeholders in memory (don't write back)
+    instructions = template.replace("{FAV_JERSEY_COLOR}", fav_color if fav_color else "not specified")
+    instructions = instructions.replace("{KNOWLEDGE_LEVEL}", level.capitalize())
+    instructions = instructions.replace("{COMMENTARY_STYLE}", style.capitalize())
+
+    return instructions
+
 
 async def create_agent(**kwargs) -> Agent:
     llm = gemini.Realtime()
 
+    # Get personalized instructions (placeholders replaced in memory)
+    instructions = get_instructions()
+
     agent = Agent(
         edge=getstream.Edge(),  # low latency edge. clients for React, iOS, Android, RN, Flutter etc.
         agent_user=User(name="AI Sports Commentator", id="agent"),
-        instructions="Read @instructions.md",
+        instructions=instructions,
         processors=[
             roboflow.RoboflowLocalDetectionProcessor(
                 classes=["person", "sports ball"],
@@ -29,12 +53,20 @@ async def create_agent(**kwargs) -> Agent:
         llm=llm,
     )
 
-    # A list of questions to pick from when pinging the model
-    questions = [
-        "Provide an update on the situation on the football field.",
-        "What has just happened?",
-        "What is happenning on the field right now?",
-    ]
+    # Style-based questions
+    style = os.getenv("COMMENTARY_STYLE", "enthusiastic")
+    if style == "roasting":
+        questions = [
+            "What's happening? Don't hold back on the roasts.",
+            "Who messed up this time?",
+            "Give me the play-by-play with your best commentary.",
+        ]
+    else:
+        questions = [
+            "Provide an update on the situation on the football field.",
+            "What has just happened?",
+            "What is happening on the field right now?",
+        ]
 
     # Call LLM once in 4s max
     debouncer = Debouncer(8)
@@ -69,4 +101,37 @@ async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> Non
 
 
 if __name__ == "__main__":
-    Runner(AgentLauncher(create_agent=create_agent, join_call=join_call)).cli()
+    import sys
+    import click
+
+    if len(sys.argv) > 1 and sys.argv[1] == "start":
+        @click.command()
+        @click.option("--color", "-c", default="", help="Your favorite team's jersey color (e.g., 'red', 'blue')")
+        @click.option("--level", "-l", type=click.Choice(["beginner", "intermediate", "expert"]), default="intermediate", help="Your football knowledge level")
+        @click.option("--style", "-s", type=click.Choice(["enthusiastic", "analytical", "casual", "roasting"]), default="enthusiastic", help="Commentary style")
+        @click.option("--video", "-v", default="", help="Video file to use (optional)")
+        def start(color: str, level: str, style: str, video: str):
+            """Start the personalized football commentator."""
+            # Set environment variables (used by get_instructions)
+            os.environ["FAV_JERSEY_COLOR"] = color
+            os.environ["KNOWLEDGE_LEVEL"] = level
+            os.environ["COMMENTARY_STYLE"] = style
+
+            click.echo("🎙️  Personalized Football Commentator")
+            click.echo(f"   Favorite Jersey: {color if color else 'None'}")
+            click.echo(f"   Knowledge Level: {level}")
+            click.echo(f"   Style: {style}")
+            click.echo()
+
+            # Build run args
+            run_args = ["run"]
+            if video:
+                run_args.extend(["--video-track-override", video])
+
+            sys.argv = [sys.argv[0]] + run_args
+            Runner(AgentLauncher(create_agent=create_agent, join_call=join_call)).cli()
+
+        sys.argv.pop(1)
+        start()
+    else:
+        Runner(AgentLauncher(create_agent=create_agent, join_call=join_call)).cli()
