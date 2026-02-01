@@ -2,6 +2,15 @@
 
 A real-time AI sports commentator that narrates live streams **exactly to the taste of each user**. Unlike generic commentary, this system adapts to your favorite team, knowledge level, and preferred commentary style.
 
+### Problem
+- one big problem with sports live stream is generic commentary does not feel interesting to everyone and not accessible to everyone either
+- not everyone understands the game enough so they feel left out and bored
+- so that results in less viewer engagement and ultimately missed revenue for game organizers
+
+### solution
+- so i'm trying to solve that with personalized commentary 
+- with this system users will be able to provide their fav team, their sports understanding level and their prefeered commentary style and their accessibility needs too
+
 ## Features
 
 - **Favorite Team Support**: Root for your team! The commentator shows extra excitement when your team (identified by jersey color) scores or makes great plays
