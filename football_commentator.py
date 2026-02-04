@@ -1,6 +1,7 @@
 import logging
 import os
 import random
+import time
 
 from dotenv import load_dotenv
 from utils import Debouncer
@@ -78,36 +79,37 @@ async def create_agent(**kwargs) -> Agent:
         "expert": "Remember: use technical jargon (xG, half-spaces, progressive passes) - the viewer is an expert.",
     }.get(level, "")
 
-    # Style-based questions with knowledge level context
+    # Style-based questions with knowledge level context (2 sentences max)
+    brief = "Keep it to 2 sentences max."
     if style == "roasting":
         questions = [
-            f"What's happening? Don't hold back on the roasts. {level_reminder}",
-            f"Give me the play-by-play with your best commentary. {level_reminder}",
+            f"What's happening? Don't hold back on the roasts. {brief} {level_reminder}",
+            f"Give me the play-by-play. {brief} {level_reminder}",
         ]
     else:
         questions = [
-            f"Provide an update on the situation on the football field. {level_reminder}",
-            f"What has just happened? {level_reminder}",
-            f"What is happening on the field right now? {level_reminder}",
+            f"What's happening on the field? {brief} {level_reminder}",
+            f"What just happened? {brief} {level_reminder}",
+            f"Quick update on the play. {brief} {level_reminder}",
         ]
 
-    # Call LLM once in 2s max
-    debouncer = Debouncer(2)
+    # Call LLM once in 8s max
+    debouncer = Debouncer(8)
 
     # Track if opening commentary has been delivered
     opening_done = False
+    opening_time = 0.0  # Timestamp when opening was delivered
+    OPENING_COOLDOWN = 20  # Seconds to wait after opening before regular commentary
 
     # Get team names for opening
     team1 = os.getenv("TEAM1_NAME", "Green Bay Packers")
     team2 = os.getenv("TEAM2_NAME", "Chicago Bears")
 
-    # Opening prompt like real broadcast commentary
+    # Opening prompt like real broadcast commentary (kept brief)
     opening_prompt = (
-        f"Welcome viewers to this match between the {team1} and the {team2}! "
-        "Give a brief, exciting broadcast-style opening. "
-        "Introduce yourself as the commentator, set the scene, "
-        "and describe what you see on the field right now. "
-        f"Keep it natural like a real TV broadcast opening. {level_reminder}"
+        f"Welcome viewers to {team1} vs {team2}! "
+        "Quick broadcast-style intro - who you are and what you see. "
+        f"Max 3 sentences. {level_reminder}"
     )
 
     @agent.events.subscribe
@@ -118,12 +120,17 @@ async def create_agent(**kwargs) -> Agent:
         This function will be called for every detection,
         so we use previously created Debouncer object to avoid calling the LLM too often.
         """
-        nonlocal opening_done
+        nonlocal opening_done, opening_time
 
         # Deliver opening commentary on first detection
         if not opening_done:
             opening_done = True
+            opening_time = time.time()
             await agent.simple_response(opening_prompt)
+            return
+
+        # Wait for opening cooldown before regular commentary
+        if time.time() - opening_time < OPENING_COOLDOWN:
             return
 
         ball_detected = bool(
