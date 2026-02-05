@@ -1,19 +1,22 @@
+import asyncio
 import logging
 import os
 import random
-import time
+from pathlib import Path
 
+import av
+import numpy as np
 from dotenv import load_dotenv
-from utils import Debouncer
+from google.genai.types import Blob
 from vision_agents.core import Agent, Runner, User
 from vision_agents.core.agents import AgentLauncher
-from vision_agents.plugins import getstream, gemini, roboflow
+from vision_agents.core.edge.events import TrackAddedEvent
+from vision_agents.plugins import getstream, gemini
 
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# Path to instructions file
 INSTRUCTIONS_PATH = os.path.join(os.path.dirname(__file__), "instructions.md")
 
 
@@ -30,7 +33,6 @@ def get_instructions() -> str:
     team1_color = os.getenv("TEAM1_COLOR", "yellow")
     team2_color = os.getenv("TEAM2_COLOR", "navy blue with orange")
 
-    # Replace placeholders in memory (don't write back)
     instructions = template.replace("{FAV_TEAM_NAME}", fav_team if fav_team else "not specified")
     instructions = instructions.replace("{KNOWLEDGE_LEVEL}", level.capitalize())
     instructions = instructions.replace("{COMMENTARY_STYLE}", style.capitalize())
@@ -42,114 +44,158 @@ def get_instructions() -> str:
     return instructions
 
 
-async def create_agent(**kwargs) -> Agent:
-    # Configure Gemini for video-only input (no microphone required)
-    # Audio output is still enabled for commentary
-    llm = gemini.Realtime(
-        config={
-            "input_audio_transcription": None,  # Disable audio input requirement
-        }
-    )
+class AudioStreamer:
+    """Streams audio from a video file to Gemini (video handled separately by framework)."""
 
-    # Get personalized instructions (placeholders replaced in memory)
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._stopped = False
+
+    async def stream_to_gemini(self, agent):
+        """Stream audio to Gemini Live."""
+        container = av.open(str(self.path))
+
+        audio_stream = container.streams.audio[0] if container.streams.audio else None
+
+        if not audio_stream:
+            logger.warning("No audio stream in video file")
+            container.close()
+            return
+
+        # Resample to 16kHz mono PCM (Gemini's expected format)
+        audio_resampler = av.audio.resampler.AudioResampler(
+            format='s16', layout='mono', rate=16000
+        )
+
+        logger.info("Streaming audio to Gemini...")
+
+        try:
+            while not self._stopped:
+                try:
+                    for packet in container.demux(audio_stream):
+                        if self._stopped:
+                            break
+
+                        for frame in packet.decode():
+                            if self._stopped:
+                                break
+
+                            for resampled in audio_resampler.resample(frame):
+                                audio_bytes = resampled.to_ndarray().flatten().astype(np.int16).tobytes()
+
+                                if agent.llm and agent.llm.connected:
+                                    blob = Blob(data=audio_bytes, mime_type="audio/pcm;rate=16000")
+                                    await agent.llm._session.send_realtime_input(audio=blob)
+
+                        await asyncio.sleep(0.001)
+
+                    # Loop audio with video
+                    container.seek(0)
+                    logger.info("Audio looped")
+
+                except Exception as e:
+                    logger.error(f"Audio stream error: {e}")
+                    await asyncio.sleep(1)
+
+        finally:
+            container.close()
+            logger.info("Audio streaming stopped")
+
+    def stop(self):
+        self._stopped = True
+
+
+async def create_agent(**kwargs) -> Agent:
+    llm = gemini.Realtime()
     instructions = get_instructions()
 
+    # Get video path for publishing
+    video_path = os.getenv("VIDEO_PATH", "")
+
     agent = Agent(
-        edge=getstream.Edge(),  # low latency edge. clients for React, iOS, Android, RN, Flutter etc.
+        edge=getstream.Edge(),
         agent_user=User(name="AI Sports Commentator", id="agent"),
         instructions=instructions,
-        processors=[
-            roboflow.RoboflowLocalDetectionProcessor(
-                classes=["person", "sports ball"],
-                conf_threshold=0.5,
-                fps=5,
-            )
-        ],
+        processors=[],
         llm=llm,
     )
 
-    # Get user preferences for prompts
+    # Set video track override so the video is displayed in the call
+    if video_path:
+        agent.set_video_track_override_path(video_path)
+
     style = os.getenv("COMMENTARY_STYLE", "enthusiastic")
     level = os.getenv("KNOWLEDGE_LEVEL", "beginner")
 
-    # Knowledge level reminder to include in prompts
     level_reminder = {
-        "beginner": "Remember: explain any football terms simply, the viewer is new to football.",
-        "intermediate": "Remember: the viewer understands basic football, explain tactics and formations.",
-        "expert": "Remember: use technical jargon (xG, half-spaces, progressive passes) - the viewer is an expert.",
+        "beginner": "Explain terms simply.",
+        "intermediate": "Explain tactics.",
+        "expert": "Use jargon freely.",
     }.get(level, "")
 
-    # Style-based questions with knowledge level context (2 sentences max)
-    brief = "Keep it to 2 sentences max."
     if style == "roasting":
         questions = [
-            f"What's happening? Don't hold back on the roasts. {brief} {level_reminder}",
-            f"Give me the play-by-play. {brief} {level_reminder}",
+            f"What's happening? Roast it. 1-2 sentences. {level_reminder}",
+            f"Comment on that play with roasts. 1-2 sentences. {level_reminder}",
         ]
     else:
         questions = [
-            f"What's happening on the field? {brief} {level_reminder}",
-            f"What just happened? {brief} {level_reminder}",
-            f"Quick update on the play. {brief} {level_reminder}",
+            f"What's happening? 1-2 sentences. {level_reminder}",
+            f"Comment on that play. 1-2 sentences. {level_reminder}",
         ]
 
-    # Call LLM once in 8s max
-    debouncer = Debouncer(8)
-
-    # Track if opening commentary has been delivered
-    opening_done = False
-    opening_time = 0.0  # Timestamp when opening was delivered
-    OPENING_COOLDOWN = 20  # Seconds to wait after opening before regular commentary
-
-    # Get team names for opening
     team1 = os.getenv("TEAM1_NAME", "Green Bay Packers")
     team2 = os.getenv("TEAM2_NAME", "Chicago Bears")
+    opening_prompt = f"Welcome to {team1} vs {team2}! Quick intro in 1-2 sentences."
 
-    # Opening prompt like real broadcast commentary (kept brief)
-    opening_prompt = (
-        f"Welcome viewers to {team1} vs {team2}! "
-        "Quick broadcast-style intro - who you are and what you see. "
-        f"Max 3 sentences. {level_reminder}"
-    )
+    # Audio streamer sends video's audio to Gemini (video handled by framework)
+    streamer = AudioStreamer(video_path) if video_path else None
+
+    commentary_task = None
+    video_task = None
+
+    async def run_commentary():
+        """Periodic commentary loop."""
+        await asyncio.sleep(3)
+
+        await agent.simple_response(opening_prompt)
+        await asyncio.sleep(5)
+
+        while True:
+            try:
+                await agent.simple_response(random.choice(questions))
+                await asyncio.sleep(4)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Commentary error: {e}")
+                await asyncio.sleep(2)
 
     @agent.events.subscribe
-    async def on_detection_completed(event: roboflow.DetectionCompletedEvent):
-        """
-        Trigger an action when Roboflow detected objects on the video.
+    async def on_track_added(event: TrackAddedEvent):
+        """Start streaming and commentary when video track is added."""
+        nonlocal commentary_task, video_task
 
-        This function will be called for every detection,
-        so we use previously created Debouncer object to avoid calling the LLM too often.
-        """
-        nonlocal opening_done, opening_time
-
-        # Deliver opening commentary on first detection
-        if not opening_done:
-            opening_done = True
-            opening_time = time.time()
-            await agent.simple_response(opening_prompt)
+        # Only trigger on VIDEO track (track_type 2 = video, 1 = audio)
+        if event.track_type != 2:
             return
 
-        # Wait for opening cooldown before regular commentary
-        if time.time() - opening_time < OPENING_COOLDOWN:
-            return
+        logger.info("Video track detected - starting commentary")
 
-        ball_detected = bool(
-            [obj for obj in event.objects if obj["label"] == "sports ball"]
-        )
-        # Ping LLM for a commentary only when the ball is detected and the call is not debounced.
-        if ball_detected and debouncer:
-            # Pick a question randomly from the list
-            await agent.simple_response(random.choice(questions))
+        if streamer and video_task is None:
+            video_task = asyncio.create_task(streamer.stream_to_gemini(agent))
+            logger.info(f"Started audio streaming to Gemini from {video_path}")
+
+        if commentary_task is None:
+            logger.info("Starting commentary loop")
+            commentary_task = asyncio.create_task(run_commentary())
 
     return agent
 
 
 async def join_call(agent: Agent, call_type: str, call_id: str, **kwargs) -> None:
     call = await agent.create_call(call_type, call_id)
-
-    # Have the agent join the call/room
     async with agent.join(call):
-        # run till the call ends
         await agent.finish()
 
 
@@ -159,34 +205,31 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "start":
         @click.command()
-        @click.option("--fav-team", "-f", default="", help="Your favorite team name (e.g., 'Green Bay Packers')")
-        @click.option("--team1", default="Green Bay Packers", help="Team 1 name (default: Green Bay Packers)")
-        @click.option("--team2", default="Chicago Bears", help="Team 2 name (default: Chicago Bears)")
-        @click.option("--level", "-l", type=click.Choice(["beginner", "intermediate", "expert"]), default="beginner", help="Your football knowledge level")
+        @click.option("--fav-team", "-f", default="", help="Your favorite team name")
+        @click.option("--team1", default="Green Bay Packers", help="Team 1 name")
+        @click.option("--team2", default="Chicago Bears", help="Team 2 name")
+        @click.option("--level", "-l", type=click.Choice(["beginner", "intermediate", "expert"]), default="beginner", help="Knowledge level")
         @click.option("--style", "-s", type=click.Choice(["enthusiastic", "analytical", "casual", "roasting"]), default="enthusiastic", help="Commentary style")
-        @click.option("--video", "-v", default="", help="Video file to use (optional)")
+        @click.option("--video", "-v", required=True, help="Video file path")
         def start(fav_team: str, team1: str, team2: str, level: str, style: str, video: str):
             """Start the personalized football commentator."""
-            # Set environment variables (used by get_instructions)
             os.environ["FAV_TEAM_NAME"] = fav_team
             os.environ["TEAM1_NAME"] = team1
             os.environ["TEAM2_NAME"] = team2
             os.environ["KNOWLEDGE_LEVEL"] = level
             os.environ["COMMENTARY_STYLE"] = style
+            os.environ["VIDEO_PATH"] = video
 
             click.echo("🎙️  Personalized Football Commentator")
+            click.echo(f"   Video: {video}")
             click.echo(f"   Favorite Team: {fav_team if fav_team else 'None'}")
             click.echo(f"   Teams: {team1} vs {team2}")
             click.echo(f"   Knowledge Level: {level}")
             click.echo(f"   Style: {style}")
             click.echo()
 
-            # Build run args
-            run_args = ["run"]
-            if video:
-                run_args.extend(["--video-track-override", video])
-
-            sys.argv = [sys.argv[0]] + run_args
+            # Run without --video-track-override since we handle it ourselves
+            sys.argv = [sys.argv[0], "run"]
             Runner(AgentLauncher(create_agent=create_agent, join_call=join_call)).cli()
 
         sys.argv.pop(1)
